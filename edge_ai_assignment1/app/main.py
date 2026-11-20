@@ -42,6 +42,15 @@ class Reading(BaseModel):
     wifi_rssi_dbm: float = Field(ge=-100, le=-20)
     age_months: float = Field(ge=0, le=120)
 
+    # A broken sensor can also send NaN or Infinity. Turn those into None so they fail
+    # validation with a clean HTTP 422 (NaN itself can't be written back in a JSON error).
+    from pydantic import field_validator
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def reject_nan_inf(cls, v):
+        return None if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))) else v
+
 
 class Batch(BaseModel):
     rows: list[Reading] = Field(min_length=1, max_length=10000)
@@ -60,16 +69,31 @@ def model_info():
     #  "fits_300kb_sram_f32": true/false, "fits_300kb_sram_int8": true/false}
     # Count only the Linear layers (ReLU has no parameters). Clue: a Linear layer m has
     # m.in_features and m.out_features.
-    lins = [m for m in net.net if isinstance(m, torch.nn.Linear)]
-    layers = [{"name": f"linear{i + 1}", "in": m.in_features, "out": m.out_features,
-               "params": m.in_features * m.out_features + m.out_features,
-               "bytes_f32": 4 * (m.in_features * m.out_features + m.out_features),
-               "macs": m.in_features * m.out_features} for i, m in enumerate(lins)]
-    tp = sum(l["params"] for l in layers)
-    limit = 300 * 1024
-    return {"layers": layers, "total_params": tp, "total_bytes_f32": 4 * tp, "total_bytes_int8": tp,
-            "total_macs": sum(l["macs"] for l in layers),
-            "fits_300kb_sram_f32": 4 * tp <= limit, "fits_300kb_sram_int8": tp <= limit}
+    layers = []
+    for m in net.net:
+        if isinstance(m, torch.nn.Linear):
+            params = m.in_features * m.out_features + m.out_features   # weights + biases
+            layers.append({
+                "name": f"linear{len(layers) + 1}",
+                "in": m.in_features,
+                "out": m.out_features,
+                "params": params,
+                "bytes_f32": params * 4,                                # float32 = 4 bytes
+                "macs": m.in_features * m.out_features,                 # one MAC per weight
+            })
+
+    total_params = sum(layer["params"] for layer in layers)
+    sram_limit = 300 * 1024                                             # ~300 KB free SRAM
+
+    return {
+        "layers": layers,
+        "total_params": total_params,
+        "total_bytes_f32": total_params * 4,
+        "total_bytes_int8": total_params * 1,                           # int8 = 1 byte
+        "total_macs": sum(layer["macs"] for layer in layers),
+        "fits_300kb_sram_f32": total_params * 4 <= sram_limit,
+        "fits_300kb_sram_int8": total_params * 1 <= sram_limit,
+    }
 
 
 @app.get("/health")
@@ -83,7 +107,7 @@ async def run(request: Request, schema):
     try:
         data = schema.model_validate_json(await request.body())
     except ValidationError as e:
-        return JSONResponse(status_code=422, content={"error": "bad reading", "detail": json.loads(e.json(include_input=False))})
+        return JSONResponse(status_code=422, content={"error": "bad reading", "detail": json.loads(e.json())})
     t["parse"] = ms(t0)
     rows = data.rows if isinstance(data, Batch) else [data]
     # TODO Mission 3: time each of the three stages below the same way "parse" is timed above,
