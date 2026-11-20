@@ -34,11 +34,13 @@ class Reading(BaseModel):
     # Give every field a sensible range, e.g. Field(ge=..., le=...), so a glitch is refused
     # with HTTP 422 instead of being answered with a made-up number. Base the limits on what a
     # real sensor can report, not on your data's min and max: real readings must still get answers.
-    battery_v: float
-    temp_c: float
-    rings_per_day: float
-    wifi_rssi_dbm: float
-    age_months: float
+    # Ranges follow what a real sensor/device can report (Li-ion cell, outdoor temps, Wi-Fi dBm),
+    # wider than the data's min/max but excluding the glitch values (0 V, -127 C, 0 dBm).
+    battery_v: float = Field(ge=2.5, le=4.4)
+    temp_c: float = Field(ge=-40, le=85)
+    rings_per_day: float = Field(ge=0, le=200)
+    wifi_rssi_dbm: float = Field(ge=-100, le=-20)
+    age_months: float = Field(ge=0, le=120)
 
 
 class Batch(BaseModel):
@@ -58,7 +60,16 @@ def model_info():
     #  "fits_300kb_sram_f32": true/false, "fits_300kb_sram_int8": true/false}
     # Count only the Linear layers (ReLU has no parameters). Clue: a Linear layer m has
     # m.in_features and m.out_features.
-    return {"layers": [], "total_params": 0}
+    lins = [m for m in net.net if isinstance(m, torch.nn.Linear)]
+    layers = [{"name": f"linear{i + 1}", "in": m.in_features, "out": m.out_features,
+               "params": m.in_features * m.out_features + m.out_features,
+               "bytes_f32": 4 * (m.in_features * m.out_features + m.out_features),
+               "macs": m.in_features * m.out_features} for i, m in enumerate(lins)]
+    tp = sum(l["params"] for l in layers)
+    limit = 300 * 1024
+    return {"layers": layers, "total_params": tp, "total_bytes_f32": 4 * tp, "total_bytes_int8": tp,
+            "total_macs": sum(l["macs"] for l in layers),
+            "fits_300kb_sram_f32": 4 * tp <= limit, "fits_300kb_sram_int8": tp <= limit}
 
 
 @app.get("/health")
@@ -72,16 +83,22 @@ async def run(request: Request, schema):
     try:
         data = schema.model_validate_json(await request.body())
     except ValidationError as e:
-        return JSONResponse(status_code=422, content={"error": "bad reading", "detail": json.loads(e.json())})
+        return JSONResponse(status_code=422, content={"error": "bad reading", "detail": json.loads(e.json(include_input=False))})
     t["parse"] = ms(t0)
     rows = data.rows if isinstance(data, Batch) else [data]
     # TODO Mission 3: time each of the three stages below the same way "parse" is timed above,
     # storing them as t["normalise"], t["inference"] and t["build"].
+    t0 = time.perf_counter()
     x = (np.array([[getattr(r, f) for f in FEATURES] for r in rows], np.float32) - MU) / SD
+    t["normalise"] = ms(t0)
+    t0 = time.perf_counter()
     with torch.no_grad():
         y = net(torch.from_numpy(x)).numpy()
+    t["inference"] = ms(t0)
+    t0 = time.perf_counter()
     days = [round(float(v), 2) for v in np.maximum(y, 0)]
     body = {"days_left": days if isinstance(data, Batch) else days[0]}
+    t["build"] = ms(t0)
     t["server_total"] = ms(t_all)
     body["timings_ms"] = t
     return body
