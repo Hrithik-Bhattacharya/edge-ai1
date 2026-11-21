@@ -117,7 +117,14 @@ async def run(request: Request, schema):
     t["normalise"] = ms(t0)
     t0 = time.perf_counter()
     with torch.no_grad():
-        y = net(torch.from_numpy(x)).numpy()
+        tensor_x = torch.from_numpy(x)
+        if isinstance(data, Batch):
+            y = np.array([
+                net(tensor_x[i:i+1]).item()
+                for i in range(len(rows))
+            ], dtype=np.float32)
+        else:
+            y = net(tensor_x).numpy()
     t["inference"] = ms(t0)
     t0 = time.perf_counter()
     days = [round(float(v), 2) for v in np.maximum(y, 0)]
